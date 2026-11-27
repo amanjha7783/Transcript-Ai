@@ -42,6 +42,8 @@ class Video(Base):
     updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
     user = relationship("User", back_populates="videos")
     segments = relationship("TranscriptSegment", back_populates="video", cascade="all, delete-orphan", order_by="TranscriptSegment.segment_index")
+    slides = relationship("Slide", back_populates="video", cascade="all, delete-orphan", order_by="Slide.slide_index")
+    slide_jobs = relationship("SlideExtractionJob", back_populates="video", cascade="all, delete-orphan", order_by="SlideExtractionJob.created_at.desc()")
 
 
 class TranscriptSegment(Base):
@@ -116,3 +118,41 @@ class Chapter(Base):
     summary = Column(Text, nullable=True)
     start = Column(Float, nullable=False)
     end = Column(Float, nullable=False)
+
+
+class Slide(Base):
+    __tablename__ = "slides"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    video_id = Column(String(36), ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    slide_index = Column(Integer, nullable=False)
+    image_filename = Column(String(500), nullable=False)
+    thumbnail_filename = Column(String(500), nullable=True)
+    timestamp_seconds = Column(Float, nullable=False)
+    timestamp_formatted = Column(String(20), nullable=False)
+    width = Column(Integer, nullable=True)
+    height = Column(Integer, nullable=True)
+    perceptual_hash = Column(String(64), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    video = relationship("Video", back_populates="slides")
+
+
+class SlideExtractionJob(Base):
+    __tablename__ = "slide_extraction_jobs"
+    id = Column(String(36), primary_key=True)
+    video_id = Column(String(36), ForeignKey("videos.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    status = Column(String(30), default="pending", nullable=False, index=True)
+    progress = Column(Float, default=0.0, nullable=False)
+    current_stage = Column(String(50), default="pending", nullable=False)
+    total_frames_processed = Column(Integer, default=0, nullable=False)
+    total_slides_detected = Column(Integer, default=0, nullable=False)
+    settings_json = Column(JSON, nullable=True)
+    error_message = Column(Text, nullable=True)
+    pdf_filename = Column(String(500), nullable=True)
+    zip_filename = Column(String(500), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    video = relationship("Video", back_populates="slide_jobs")
+

@@ -19,6 +19,9 @@ services:
       DATABASE_URL: postgresql+psycopg://videomind:videomind_local_password@db:5432/videomind
       SECRET_KEY: change-this-before-deployment
       UPLOADS_DIR: /app/storage/uploads
+      SLIDES_DIR: /app/storage/slides
+      TEMP_DIR: /app/storage/temp
+      SLIDES_ENABLED: "true"
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
