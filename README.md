@@ -20,6 +20,9 @@ This repository is a runnable MVP with an extensible architecture. It uses real 
 | Summaries | Short, detailed, bullet, key-takeaway, technical, revision, etc. |
 | Study assistant | Notes, MCQs, flashcards, viva prompts |
 | Chapters | LLM-generated topic chapters with time ranges |
+| AI Slide Extractor | Computer-vision slide extraction (FFmpeg + OpenCV dHash + structural correlation + sharpness); timestamped slide gallery |
+| Slide Export | Presentation-ready PDF generation (one slide per landscape page + footer metadata) and ZIP download |
+| Public Video Ingestion | Extensible provider-adapter architecture (yt-dlp for YouTube, SSRF-protected streaming for direct MP4/WebM URLs) |
 | Semantic search | Multilingual query embeddings and transcript chunk retrieval |
 | Subtitles | SRT and WebVTT downloads, original or translated |
 | Export | TXT, Markdown, PDF, DOCX |
@@ -29,36 +32,30 @@ This repository is a runnable MVP with an extensible architecture. It uses real 
 ## Architecture
 
 ```text
-Video upload / YouTube captions
+Video upload / YouTube captions / Public video link
             |
-            v
-      FFmpeg audio extraction (uploaded files)
-            |
-            v
-   faster-whisper transcription / caption segments
-            |
-            v
-  Timestamped transcript segments (SQL database)
-            |
-            v
-  Transcript chunking + overlap + timestamp metadata
-            |
-            v
-    multilingual SentenceTransformer embeddings
-            |
-            v
-      PostgreSQL + pgvector (or SQLite dev mode)
-            |
-User question -> query embedding -> per-video retrieval
-            |                          |
-            +------ relevant chunks ---+
-                           |
-                           v
-             OpenAI-compatible LLM endpoint
-                           |
-                           v
-        Grounded answer + source timestamp references
+            +-------------------------------------------+
+            |                                           |
+            v                                           v
+[Speech Transcription Pipeline]             [AI Slide Extraction Pipeline]
+      FFmpeg audio extraction               FFprobe metadata & resolution
+            |                                           |
+            v                                           v
+   faster-whisper transcription             FFmpeg frame extraction (configurable FPS)
+            |                                           |
+            v                                           v
+  Timestamped transcript segments           OpenCV perceptual hashing & sharpness
+            |                                           |
+            v                                           v
+  Chunking + multilingual embeddings        Deduplication & transition stabilization
+            |                                           |
+            v                                           v
+       pgvector / SQLite                    Timestamped unique slide gallery
+            |                                           |
+            v                                           v
+    RAG-grounded chat & study tools         ReportLab Landscape PDF & ZIP export
 ```
+
 
 ### Main technology choices
 
@@ -194,7 +191,8 @@ Docker Compose uses PostgreSQL with pgvector. Persistent database, uploaded medi
 6. Open **Translate** to choose a target language.
 7. Open **Summary** to generate an AI summary.
 8. Open **Ask video** to ask a question. The response includes retrieved transcript source ranges; select a source to seek to that time in an uploaded video.
-9. Use **Study tools**, **Chapters**, **Subtitles**, and **Export** for the remaining workflows.
+9. Open **Slides** to extract presentation slides, browse the timestamped gallery, preview full slides, jump to slide timestamps in the video player, and download the complete PDF or ZIP image bundle.
+10. Use **Study tools**, **Chapters**, **Subtitles**, and **Export** for the remaining workflows.
 
 ## Environment variables
 
@@ -203,7 +201,16 @@ Docker Compose uses PostgreSQL with pgvector. Persistent database, uploaded medi
 | `DATABASE_URL` | SQL database connection | `sqlite:///./videomind.db` |
 | `SECRET_KEY` | JWT signing secret | development placeholder (replace it) |
 | `UPLOADS_DIR` | Upload storage path | `../storage/uploads` |
+| `SLIDES_DIR` | Extracted slides directory | `../storage/slides` |
+| `TEMP_DIR` | Temporary download & frame working dir | `../storage/temp` |
 | `MAX_UPLOAD_MB` | Maximum upload size | `500` |
+| `SLIDES_ENABLED` | Toggle slide extraction feature | `true` |
+| `SLIDE_SAMPLE_FPS` | Candidate frame extraction FPS | `1.0` |
+| `SLIDE_OUTPUT_WIDTH` | Extracted slide resolution width | `1280` |
+| `SLIDE_MIN_INTERVAL_SECONDS` | Minimum interval between detected slides | `1.5` |
+| `SLIDE_DETECTION_THRESHOLD` | Scene-change detection sensitivity | `0.02` |
+| `SLIDE_SIMILARITY_THRESHOLD` | Perceptual correlation dedupe threshold | `0.88` |
+| `SLIDE_MAX_VIDEO_SIZE_MB` | Max download size for public URL ingest | `500` |
 | `WHISPER_MODEL` | faster-whisper model size/name | `base` |
 | `WHISPER_DEVICE` | `cpu` or `cuda` | `cpu` |
 | `WHISPER_COMPUTE_TYPE` | CTranslate2 compute type | `int8` |
@@ -227,17 +234,52 @@ FastAPI interactive docs at `/docs` list all endpoints. Main routes include:
 - `POST /api/videos/{id}/search`, `GET /api/videos/{id}/subtitles/{language}`
 - `GET /api/videos/{id}/export`, `DELETE /api/videos/{id}`
 
-All video routes require a Bearer token except health. The video element uses a JWT query parameter because native media elements cannot attach a Bearer header; for a public production deployment, replace this with signed object-storage URLs or authenticated cookie streaming.
+### AI Slide Extractor endpoints:
+
+- `POST /api/videos/{id}/slides/extract` — Start slide extraction for an existing video (with optional settings: `sample_fps`, `output_width`, `min_interval_seconds`, `detection_threshold`, `duplicate_removal`).
+- `POST /api/videos/slides/extract-url` — Validate public video URL (YouTube or direct HTTP/HTTPS), ingest metadata, and start slide extraction.
+- `GET /api/videos/{id}/slides/status` — Get extraction job progress, current stage, frames analyzed, and slides detected.
+- `GET /api/videos/{id}/slides` — Return list of extracted slides with indices, timestamps, and dimensions.
+- `GET /api/videos/{id}/slides/{slide_id}/image` — Securely stream or serve the full-resolution slide image.
+- `GET /api/videos/{id}/slides/{slide_id}/thumbnail` — Securely serve slide thumbnail for fast gallery rendering.
+- `GET /api/videos/{id}/slides/export.pdf` — Download presentation-ready PDF with one slide per page and timestamp footer.
+- `GET /api/videos/{id}/slides/export.zip` — Download complete ZIP archive of all slide images.
+- `DELETE /api/videos/{id}/slides` — Delete extracted slides, job record, and export files.
+- `GET /api/system/capabilities` — Return status of FFmpeg, FFprobe, OpenCV, Pillow, yt-dlp, and JavaScript runtimes.
+
+All video routes require a Bearer token except health and media elements (which support query tokens).
 
 ## Tests
 
 From `backend`:
 
 ```bash
-python -m pytest
+python -m pytest -v
 ```
 
-The included tests cover semantic chunk timestamp handling, SRT/VTT time formatting, and YouTube URL allow-list validation. Add integration tests with small sample videos and a test LLM endpoint before production use.
+The test suite covers:
+- Chunking and timestamp preservation.
+- SRT/VTT subtitle generation.
+- YouTube ID parsing and provider allow-lists.
+- SSRF protection against private IPs, loopback, and cloud metadata.
+- Perceptual difference hashing (dHash) and Hamming distance.
+- Image sharpness estimation and downsampled structural similarity.
+- Slide extraction on a synthetic 3-slide video with known timestamps.
+- ReportLab landscape PDF generation with footer metadata.
+- ZIP export archive generation.
+- Authenticated slide API endpoints and cascading file cleanup.
+
+## JavaScript runtime for YouTube (EJS Challenge Solver)
+
+When extracting media from YouTube with `yt-dlp`, a JavaScript runtime can be used for YouTube EJS challenge solving.
+`yt-dlp` automatically detects `node`, `deno`, `bun`, or `qjs` on your `PATH`.
+
+Recommended setup:
+- **Node.js**: If you already have Node installed (used for the frontend), `yt-dlp` will detect it automatically.
+- **Deno** (optional recommendation):
+  - Windows: `irm https://deno.land/install.ps1 | iex`
+  - Linux: `curl -fsSL https://deno.land/install.sh | sh`
+
 
 ## Known limitations and next engineering steps
 

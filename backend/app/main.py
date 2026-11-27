@@ -19,14 +19,18 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.database import SessionLocal, get_db, init_db
 from app.models import (
-    Chapter, ChatMessage, Summary, StudyMaterial, TranscriptChunk,
-    TranscriptSegment, Translation, User, Video,
+    Chapter, ChatMessage, Slide, SlideExtractionJob, Summary, StudyMaterial,
+    TranscriptChunk, TranscriptSegment, Translation, User, Video,
 )
 from app.security import create_access_token, get_current_user, hash_password, verify_password
 from app.services.embeddings import embed_texts
 from app.services.llm import generate
 from app.services.media import extract_audio
+from app.services.providers.registry import detect_platform, get_provider, get_system_capabilities
 from app.services.rag import index_video, retrieve, transcript_segments
+from app.services.slide_pipeline import (
+    SLIDES_DIR, get_video_slides_dir, run_slide_extraction_job,
+)
 from app.services.subtitles import make_subtitles
 from app.services.transcription import transcribe_audio
 from app.services.youtube import extract_youtube_id, fetch_youtube_transcript
@@ -90,6 +94,19 @@ class TranscriptUpdate(BaseModel):
 class SearchRequest(BaseModel):
     query: str = Field(min_length=2, max_length=1000)
     top_k: int = Field(default=8, ge=1, le=20)
+
+
+class SlideExtractSettings(BaseModel):
+    sample_fps: float = Field(default=1.0, ge=0.2, le=5.0)
+    output_width: int = Field(default=1280, ge=640, le=1920)
+    min_interval_seconds: float = Field(default=1.5, ge=0.5, le=10.0)
+    detection_threshold: float = Field(default=0.02, ge=0.005, le=0.2)
+    duplicate_removal: bool = Field(default=True)
+
+
+class SlideUrlExtractRequest(BaseModel):
+    url: str = Field(min_length=10, max_length=2000)
+    settings: SlideExtractSettings | None = None
 
 
 def _video_dict(video: Video) -> dict[str, Any]:
@@ -168,8 +185,10 @@ def _process_uploaded_video(video_id: str) -> None:
         db.rollback()
         video = db.query(Video).filter(Video.id == video_id).first()
         if video:
-            video.status = "failed"
-            video.error_message = str(exc)[:1000]
+            # Set status to "ready" so slide extraction and other features
+            # still work even when transcription fails.
+            video.status = "ready"
+            video.error_message = f"Transcript unavailable: {str(exc)[:900]}. Slide extraction may still succeed."
             db.commit()
     finally:
         db.close()
@@ -184,9 +203,30 @@ def _process_youtube_video(video_id: str) -> None:
         video.status = "processing"
         db.commit()
         youtube_id = extract_youtube_id(video.source_url)
-        segments, language = fetch_youtube_transcript(youtube_id)
+        try:
+            segments, language = fetch_youtube_transcript(youtube_id)
+        except Exception as transcript_exc:
+            # Transcript fetch failed — set video to "ready" with an informational
+            # message so slide extraction and other features still work.
+            video = db.query(Video).filter(Video.id == video_id).first()
+            if video:
+                video.status = "ready"
+                video.error_message = (
+                    f"Transcript unavailable: {str(transcript_exc)[:800]}. "
+                    "Slide extraction may still succeed."
+                )
+                db.commit()
+            return
         if not segments:
-            raise RuntimeError("No captions were returned for this video. Upload a video file or try a video with captions enabled.")
+            video = db.query(Video).filter(Video.id == video_id).first()
+            if video:
+                video.status = "ready"
+                video.error_message = (
+                    "No captions were returned for this video. "
+                    "Slide extraction may still succeed."
+                )
+                db.commit()
+            return
         video.title = f"YouTube video {youtube_id}"
         video.thumbnail_url = f"https://img.youtube.com/vi/{youtube_id}/hqdefault.jpg"
         _save_segments(db, video, segments, language)
@@ -194,8 +234,8 @@ def _process_youtube_video(video_id: str) -> None:
         db.rollback()
         video = db.query(Video).filter(Video.id == video_id).first()
         if video:
-            video.status = "failed"
-            video.error_message = str(exc)[:1000]
+            video.status = "ready"
+            video.error_message = f"Transcript unavailable: {str(exc)[:900]}. Slide extraction may still succeed."
             db.commit()
     finally:
         db.close()
@@ -318,6 +358,22 @@ async def upload_video(
     db.add(video)
     db.commit()
     background_tasks.add_task(_process_uploaded_video, video_id)
+
+    # Auto-trigger slide extraction alongside transcription
+    slide_job_id = str(uuid.uuid4())
+    slide_job = SlideExtractionJob(
+        id=slide_job_id,
+        video_id=video.id,
+        user_id=user.id,
+        status="pending",
+        progress=0.0,
+        current_stage="queued",
+        settings_json={},
+    )
+    db.add(slide_job)
+    db.commit()
+    background_tasks.add_task(run_slide_extraction_job, video.id, slide_job_id, {})
+
     return _video_dict(video)
 
 
@@ -340,6 +396,22 @@ def process_url(payload: UrlRequest, background_tasks: BackgroundTasks, user: Us
     db.add(video)
     db.commit()
     background_tasks.add_task(_process_youtube_video, video.id)
+
+    # Auto-trigger slide extraction alongside transcript fetch
+    slide_job_id = str(uuid.uuid4())
+    slide_job = SlideExtractionJob(
+        id=slide_job_id,
+        video_id=video.id,
+        user_id=user.id,
+        status="pending",
+        progress=0.0,
+        current_stage="queued",
+        settings_json={},
+    )
+    db.add(slide_job)
+    db.commit()
+    background_tasks.add_task(run_slide_extraction_job, video.id, slide_job_id, {})
+
     return _video_dict(video)
 
 
@@ -713,4 +785,354 @@ def delete_video(video_id: str, user: User = Depends(get_current_user), db: Sess
     if filename:
         (UPLOADS_DIR / filename).unlink(missing_ok=True)
     (UPLOADS_DIR / f"{video_id}.audio.mp3").unlink(missing_ok=True)
+    slide_dir = SLIDES_DIR / str(user.id) / str(video_id)
+    if slide_dir.exists():
+        shutil.rmtree(slide_dir, ignore_errors=True)
     return {"message": "Video and associated data deleted."}
+
+
+@app.get("/api/system/capabilities")
+def system_capabilities():
+    """Return system capabilities and tool statuses for slide extraction and media processing."""
+    return get_system_capabilities()
+
+
+def _resolve_auth_user_id(token: str | None, user: User | None) -> str:
+    """Helper to authenticate user either from JWT Authorization header or query token parameter."""
+    if user:
+        return user.id
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    import jwt
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=["HS256"])
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token payload.")
+        return user_id
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail="Invalid or expired media token.") from exc
+
+
+@app.post("/api/videos/{video_id}/slides/extract")
+def extract_slides_for_video(
+    video_id: str,
+    background_tasks: BackgroundTasks,
+    payload: SlideExtractSettings | None = None,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    video = _get_video(db, video_id, user)
+
+    # Check if a job is currently active for this video
+    active_job = db.query(SlideExtractionJob).filter(
+        SlideExtractionJob.video_id == video.id,
+        SlideExtractionJob.status.in_(["pending", "processing"]),
+    ).first()
+    if active_job:
+        return {
+            "job_id": active_job.id,
+            "status": active_job.status,
+            "current_stage": active_job.current_stage,
+            "progress": active_job.progress,
+            "message": "Slide extraction is already in progress for this video.",
+        }
+
+    job_id = str(uuid.uuid4())
+    settings_dict = payload.model_dump() if payload else {}
+    job = SlideExtractionJob(
+        id=job_id,
+        video_id=video.id,
+        user_id=user.id,
+        status="pending",
+        progress=0.0,
+        current_stage="queued",
+        settings_json=settings_dict,
+    )
+    db.add(job)
+    db.commit()
+
+    background_tasks.add_task(run_slide_extraction_job, video.id, job_id, settings_dict)
+    return {
+        "job_id": job.id,
+        "video_id": video.id,
+        "status": job.status,
+        "progress": job.progress,
+        "current_stage": job.current_stage,
+    }
+
+
+@app.post("/api/videos/slides/extract-url")
+def extract_slides_from_url(
+    payload: SlideUrlExtractRequest,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    url = payload.url.strip()
+    try:
+        provider = get_provider(url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Attempt to retrieve available metadata without downloading
+    try:
+        meta = provider.get_metadata(url)
+        title = meta.title
+        duration = meta.duration
+        thumbnail_url = meta.thumbnail_url
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Check if video already exists for this user and URL
+    video = db.query(Video).filter(Video.user_id == user.id, Video.source_url == url).first()
+    if not video:
+        video_id = str(uuid.uuid4())
+        video = Video(
+            id=video_id,
+            user_id=user.id,
+            title=title[:500],
+            source_type=provider.name,
+            source_url=url,
+            thumbnail_url=thumbnail_url,
+            duration=duration,
+            status="ready",
+            rag_status="pending",
+        )
+        db.add(video)
+        db.commit()
+
+    # Check if a slide extraction job is already running
+    active_job = db.query(SlideExtractionJob).filter(
+        SlideExtractionJob.video_id == video.id,
+        SlideExtractionJob.status.in_(["pending", "processing"]),
+    ).first()
+    if active_job:
+        return {
+            "video": _video_dict(video),
+            "job_id": active_job.id,
+            "status": active_job.status,
+            "progress": active_job.progress,
+            "current_stage": active_job.current_stage,
+            "message": "Slide extraction already running for this video.",
+        }
+
+    job_id = str(uuid.uuid4())
+    settings_dict = payload.settings.model_dump() if payload.settings else {}
+    job = SlideExtractionJob(
+        id=job_id,
+        video_id=video.id,
+        user_id=user.id,
+        status="pending",
+        progress=0.0,
+        current_stage="queued",
+        settings_json=settings_dict,
+    )
+    db.add(job)
+    db.commit()
+
+    background_tasks.add_task(run_slide_extraction_job, video.id, job_id, settings_dict)
+    return {
+        "video": _video_dict(video),
+        "job_id": job.id,
+        "status": job.status,
+        "progress": job.progress,
+        "current_stage": job.current_stage,
+    }
+
+
+@app.get("/api/videos/{video_id}/slides/status")
+def get_slide_job_status(
+    video_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    video = _get_video(db, video_id, user)
+    job = db.query(SlideExtractionJob).filter(
+        SlideExtractionJob.video_id == video.id,
+    ).order_by(SlideExtractionJob.created_at.desc()).first()
+
+    if not job:
+        # Check if slides already exist
+        slide_count = db.query(Slide).filter(Slide.video_id == video.id).count()
+        return {
+            "status": "completed" if slide_count > 0 else "not_started",
+            "progress": 100.0 if slide_count > 0 else 0.0,
+            "current_stage": "completed" if slide_count > 0 else "idle",
+            "total_frames_processed": 0,
+            "total_slides_detected": slide_count,
+            "error_message": None,
+        }
+
+    return {
+        "id": job.id,
+        "status": job.status,
+        "progress": job.progress,
+        "current_stage": job.current_stage,
+        "total_frames_processed": job.total_frames_processed,
+        "total_slides_detected": job.total_slides_detected,
+        "error_message": job.error_message,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+    }
+
+
+@app.get("/api/videos/{video_id}/slides")
+def list_video_slides(
+    video_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    video = _get_video(db, video_id, user)
+    slides = db.query(Slide).filter(Slide.video_id == video.id).order_by(Slide.slide_index.asc()).all()
+    job = db.query(SlideExtractionJob).filter(
+        SlideExtractionJob.video_id == video.id,
+    ).order_by(SlideExtractionJob.created_at.desc()).first()
+
+    return {
+        "video_id": video.id,
+        "total_slides": len(slides),
+        "job_status": job.status if job else ("completed" if slides else "none"),
+        "slides": [
+            {
+                "id": s.id,
+                "slide_index": s.slide_index,
+                "timestamp_seconds": s.timestamp_seconds,
+                "timestamp_formatted": s.timestamp_formatted,
+                "width": s.width,
+                "height": s.height,
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+            }
+            for s in slides
+        ],
+    }
+
+
+@app.get("/api/videos/{video_id}/slides/{slide_id}/image")
+def get_slide_image(
+    video_id: str,
+    slide_id: int,
+    token: str | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    # Support token in query parameter for browser <img> tags
+    user_id = _resolve_auth_user_id(token, None)
+    slide = db.query(Slide).filter(
+        Slide.id == slide_id,
+        Slide.video_id == video_id,
+        Slide.user_id == user_id,
+    ).first()
+    if not slide:
+        raise HTTPException(status_code=404, detail="Slide not found.")
+
+    slide_dir = get_video_slides_dir(user_id, video_id)
+    img_path = slide_dir / slide.image_filename
+    if not img_path.is_file():
+        raise HTTPException(status_code=404, detail="Slide image file is missing.")
+
+    return FileResponse(img_path, media_type="image/jpeg", filename=slide.image_filename)
+
+
+@app.get("/api/videos/{video_id}/slides/{slide_id}/thumbnail")
+def get_slide_thumbnail(
+    video_id: str,
+    slide_id: int,
+    token: str | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    user_id = _resolve_auth_user_id(token, None)
+    slide = db.query(Slide).filter(
+        Slide.id == slide_id,
+        Slide.video_id == video_id,
+        Slide.user_id == user_id,
+    ).first()
+    if not slide:
+        raise HTTPException(status_code=404, detail="Slide not found.")
+
+    slide_dir = get_video_slides_dir(user_id, video_id)
+    thumb_name = slide.thumbnail_filename or slide.image_filename
+    thumb_path = slide_dir / thumb_name
+    if not thumb_path.is_file():
+        thumb_path = slide_dir / slide.image_filename
+    if not thumb_path.is_file():
+        raise HTTPException(status_code=404, detail="Slide thumbnail file is missing.")
+
+    return FileResponse(thumb_path, media_type="image/jpeg", filename=thumb_name)
+
+
+@app.get("/api/videos/{video_id}/slides/export.pdf")
+def export_slides_pdf(
+    video_id: str,
+    token: str | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    user_id = _resolve_auth_user_id(token, None)
+    video = db.query(Video).filter(Video.id == video_id, Video.user_id == user_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found.")
+
+    slide_dir = get_video_slides_dir(user_id, video_id)
+    pdf_path = slide_dir / "slides.pdf"
+
+    if not pdf_path.is_file():
+        # Generate on the fly if needed
+        slides = db.query(Slide).filter(Slide.video_id == video.id).order_by(Slide.slide_index.asc()).all()
+        if not slides:
+            raise HTTPException(status_code=404, detail="No extracted slides to export.")
+        slides_info = [
+            {"image_filename": s.image_filename, "timestamp_formatted": s.timestamp_formatted}
+            for s in slides
+        ]
+        generate_slide_pdf(slides_info, str(slide_dir), str(pdf_path), video_title=video.title)
+
+    safe_title = "".join(c for c in video.title if c.isalnum() or c in " ._-")[:40].strip() or "slides"
+    filename = f"{safe_title}-slides.pdf"
+    return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+
+
+@app.get("/api/videos/{video_id}/slides/export.zip")
+def export_slides_zip(
+    video_id: str,
+    token: str | None = Query(None),
+    db: Session = Depends(get_db),
+):
+    user_id = _resolve_auth_user_id(token, None)
+    video = db.query(Video).filter(Video.id == video_id, Video.user_id == user_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found.")
+
+    slide_dir = get_video_slides_dir(user_id, video_id)
+    zip_path = slide_dir / "slides.zip"
+
+    if not zip_path.is_file():
+        slides = db.query(Slide).filter(Slide.video_id == video.id).order_by(Slide.slide_index.asc()).all()
+        if not slides:
+            raise HTTPException(status_code=404, detail="No extracted slides to export.")
+        slides_info = [
+            {"image_filename": s.image_filename, "timestamp_formatted": s.timestamp_formatted}
+            for s in slides
+        ]
+        generate_slide_zip(slides_info, str(slide_dir), str(zip_path), video_title=video.title)
+
+    safe_title = "".join(c for c in video.title if c.isalnum() or c in " ._-")[:40].strip() or "slides"
+    filename = f"{safe_title}-slides.zip"
+    return FileResponse(zip_path, media_type="application/zip", filename=filename)
+
+
+@app.delete("/api/videos/{video_id}/slides")
+def delete_video_slides(
+    video_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    video = _get_video(db, video_id, user)
+    db.query(Slide).filter(Slide.video_id == video.id).delete()
+    db.query(SlideExtractionJob).filter(SlideExtractionJob.video_id == video.id).delete()
+    db.commit()
+
+    slide_dir = get_video_slides_dir(str(user.id), str(video.id))
+    if slide_dir.exists():
+        shutil.rmtree(slide_dir, ignore_errors=True)
+
+    return {"message": "Extracted slides and export files deleted."}
+
